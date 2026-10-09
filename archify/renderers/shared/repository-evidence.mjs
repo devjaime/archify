@@ -1,11 +1,13 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { throwDiagnosticError } from './diagnostics.mjs';
-import { parseRepositoryRemote, redactRepositoryRemote, repositorySourceHref } from './repository-location.mjs';
+import { throwDiagnosticError, withDiagnosticRecordingSuppressed } from './diagnostics.mjs';
+import { sameEntry } from './path-semantics.mjs';
+import { parseRepositoryRemote, redactRepositoryRemote, repositorySourceHref, repositoryTreeHref } from './repository-location.mjs';
 
 const FULL_SHA_RE = /^[a-f0-9]{40}$/i;
 const CONTROL_CHARACTER_RE = /[\u0000-\u001f\u007f]/;
+const MAX_SOURCE_BYTES = 16 * 1024 * 1024;
 
 function evidenceFailure(code, message, { subject = {}, evidence = {}, supportedFixes = [] } = {}) {
   throwDiagnosticError(message, [{
@@ -22,13 +24,63 @@ function runGit(repoRoot, args) {
   // 固定 SHA 的来源必须读取原始对象，不能使用本地 replacement refs 的替换内容。
   const result = spawnSync('git', ['--no-replace-objects', '-C', repoRoot, ...args], {
     encoding: 'utf8',
-    maxBuffer: 16 * 1024 * 1024,
+    maxBuffer: MAX_SOURCE_BYTES,
   });
   if (result.error) evidenceFailure('repository-evidence/git-unavailable', `Could not run Git: ${result.error.message}`, {
     evidence: { reason: result.error.message },
     supportedFixes: ['install Git and ensure it is available on PATH'],
   });
   return result;
+}
+
+// Check types in one session, then read only blobs whose cited lines need
+// verification. Path-only references never require loading the file contents.
+function prefetchBlobs(repoRoot, objectNeedsContent) {
+  const blobs = readBatchObjects(repoRoot, [...objectNeedsContent.keys()], false);
+  if (!blobs) return null;
+  const readable = [...objectNeedsContent].filter(([object, needsContent]) => {
+    const blob = blobs.get(object);
+    return needsContent && blob?.type === 'blob' && blob.size <= MAX_SOURCE_BYTES;
+  }).map(([object]) => object);
+  const contents = readBatchObjects(repoRoot, readable, true);
+  if (contents) for (const [object, blob] of contents) blobs.set(object, blob);
+  // Failed or oversized reads fall back in source order to the original
+  // per-file path, preserving its size limit and diagnostic behavior.
+  return blobs;
+}
+
+function readBatchObjects(repoRoot, objects, includeContent) {
+  if (!objects.length) return new Map();
+  const mode = includeContent ? '--batch' : '--batch-check';
+  const result = spawnSync('git', ['--no-replace-objects', '-C', repoRoot, 'cat-file', mode], {
+    input: objects.join('\n') + '\n',
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (result.error || result.status !== 0 || !Buffer.isBuffer(result.stdout)) return null;
+  const buffer = result.stdout;
+  const blobs = new Map();
+  let cursor = 0;
+  for (const object of objects) {
+    const newline = buffer.indexOf(0x0a, cursor);
+    if (newline < 0) return null;
+    const header = buffer.toString('utf8', cursor, newline);
+    cursor = newline + 1;
+    if (header.endsWith(' missing')) {
+      blobs.set(object, { missing: true });
+      continue;
+    }
+    const parts = header.split(' ');
+    const size = Number(parts[2]);
+    if (parts.length !== 3 || !Number.isSafeInteger(size) || size < 0) return null;
+    const blob = { type: parts[1], size };
+    if (includeContent) {
+      if (cursor + size >= buffer.length || buffer[cursor + size] !== 0x0a) return null;
+      blob.content = buffer.toString('utf8', cursor, cursor + size);
+      cursor += size + 1;
+    }
+    blobs.set(object, blob);
+  }
+  return blobs;
 }
 
 function gitValue(repoRoot, args, failure) {
@@ -42,6 +94,7 @@ function gitValue(repoRoot, args, failure) {
 
 function verifiedSourcePath(value, where) {
   const sourcePath = String(value || '');
+  // path-contract-allow: git-path -- Git tree entries use repository-relative POSIX syntax.
   if (!sourcePath || sourcePath.startsWith('/') || sourcePath.includes('\\') || CONTROL_CHARACTER_RE.test(sourcePath)) {
     evidenceFailure('repository-evidence/path-invalid', `${where} must be a repo-relative POSIX path.`, {
       subject: { path: where },
@@ -76,6 +129,11 @@ const EVIDENCE_NODE_COLLECTIONS = {
   sequence: 'participants',
   dataflow: 'nodes',
   lifecycle: 'states',
+  erd: 'entities',
+  tree: 'nodes',
+  class: 'types',
+  timeline: 'events',
+  waterfall: 'spans',
 };
 
 function evidenceNodes(diagramType, diagram) {
@@ -106,25 +164,31 @@ export function verifyRepositoryEvidence(diagramType, diagram, repoRootInput) {
       supportedFixes: ['pin one full 40-character commit SHA'],
     });
   }
-  const location = parseRepositoryRemote(repository.url, { authored: true });
+  const location = parseRepositoryRemote(repository.url, { authored: true, provider: repository.provider });
   if (!location) {
+    // A filesystem path is the common authoring mistake: the field carries the
+    // remote origin identity, which `git remote get-url origin` reports.
+    const filesystemPath = /^(?:[\\/]|~|\.{1,2}(?:[\\/]|$)|[A-Za-z]:[\\/])/.test(String(repository.url ?? ''));
     evidenceFailure('repository-evidence/url-invalid', '/meta/repository/url must be a credential-free HTTP(S) or Git SSH repository address without query, fragment, or dot segments.', {
       subject: { path: '/meta/repository/url' },
-      supportedFixes: ['declare the matching repository address without credentials; use link_mode: local-only for internal repositories'],
+      evidence: filesystemPath ? { authoredValueLooksLike: 'local filesystem path; the expected value is the remote origin address' } : {},
+      supportedFixes: ['run `git remote get-url origin` inside --repo-root and declare that credential-free address', 'use link_mode: local-only for internal repositories'],
     });
   }
   const linkMode = repository.link_mode ?? 'web';
   if (!['web', 'local-only'].includes(linkMode)) evidenceFailure('repository-evidence/link-mode-invalid', 'Repository link_mode must be web or local-only.');
-  if (repository.provider !== undefined && (!['github', 'gitee'].includes(repository.provider) || repository.provider !== location.provider)) {
-    evidenceFailure('repository-evidence/provider-invalid', 'Repository provider must match its supported public host (github.com or gitee.com).', {
+  if (repository.provider !== undefined && (!['github', 'gitee', 'gitlab'].includes(repository.provider) || repository.provider !== location.provider)) {
+    evidenceFailure('repository-evidence/provider-invalid', 'Repository provider must match its supported public host (github.com, gitee.com or gitlab.com); gitlab also names a self-managed GitLab host.', {
       subject: { path: '/meta/repository/provider' },
       supportedFixes: ['use the matching provider or omit provider and select link_mode: local-only'],
     });
   }
-  if (linkMode === 'web' && (!location.provider || location.protocol !== 'https:' || location.endpoint !== 'standard' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(location.path))) {
-    evidenceFailure('repository-evidence/links-unsupported', 'Web source links require a canonical GitHub or Gitee HTTPS owner/repository URL.', {
+  // GitLab projects may sit in nested groups; GitHub and Gitee are owner/repository.
+  const webPath = location.provider === 'gitlab' ? /^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+$/ : /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+  if (linkMode === 'web' && (!location.provider || location.protocol !== 'https:' || location.endpoint !== 'standard' || !webPath.test(location.path))) {
+    evidenceFailure('repository-evidence/links-unsupported', 'Web source links require a canonical GitHub, Gitee, or GitLab HTTPS repository URL.', {
       subject: { path: '/meta/repository/url' },
-      supportedFixes: ['use a canonical GitHub or Gitee URL, or select link_mode: local-only to retain local verification without web links'],
+      supportedFixes: ['use a canonical GitHub, Gitee, or GitLab HTTPS URL; declare provider: gitlab for a self-managed GitLab host', 'select link_mode: local-only to retain local verification without web links'],
     });
   }
   if (!repoRootInput) {
@@ -146,7 +210,15 @@ export function verifyRepositoryEvidence(diagramType, diagram, repoRootInput) {
     });
   }
   const gitRoot = gitValue(realRoot, ['rev-parse', '--show-toplevel'], `Evidence root "${realRoot}" is not a Git repository.`);
-  if (fs.realpathSync(gitRoot) !== realRoot) {
+  const rootIdentity = sameEntry(realRoot, gitRoot);
+  if (rootIdentity.status === 'unknown') {
+    evidenceFailure('repository-evidence/root-identity-indeterminate', 'Could not determine whether the evidence root is the Git top-level directory.', {
+      subject: { repoRoot: realRoot },
+      evidence: { gitTopLevel: gitRoot, relation: rootIdentity.reason },
+      supportedFixes: ['pass the readable Git top-level directory using its canonical filesystem path'],
+    });
+  }
+  if (rootIdentity.status === 'different') {
     evidenceFailure('repository-evidence/root-not-top-level', `Evidence root must be the Git top-level directory: ${gitRoot}`, {
       subject: { repoRoot: realRoot },
       evidence: { gitTopLevel: gitRoot },
@@ -154,7 +226,7 @@ export function verifyRepositoryEvidence(diagramType, diagram, repoRootInput) {
     });
   }
   const origin = gitValue(realRoot, ['remote', 'get-url', 'origin'], 'Evidence repository must have an origin remote.');
-  if (parseRepositoryRemote(origin)?.identity !== location.identity) {
+  if (parseRepositoryRemote(origin, { provider: repository.provider })?.identity !== location.identity) {
     const safeOrigin = redactRepositoryRemote(origin);
     evidenceFailure('repository-evidence/origin-mismatch', `Evidence repository origin ${JSON.stringify(safeOrigin)} does not match ${JSON.stringify(repository.url)}.`, {
       subject: { repoRoot: realRoot },
@@ -172,6 +244,26 @@ export function verifyRepositoryEvidence(diagramType, diagram, repoRootInput) {
       supportedFixes: ['fetch the pinned commit or pin an available full commit SHA'],
     });
   }
+
+  // The batch is an optimization only: every path, line-range, file and line
+  // check still runs in source order in the verification loop below, so a
+  // citation the batch cannot answer for never reorders the first diagnostic.
+  const citedObjects = new Map();
+  for (const [nodeIndex, node] of authoredNodes.entries()) {
+    if (!Array.isArray(node.sources) || node.sources.length === 0) continue;
+    for (const [sourceIndex, authored] of node.sources.entries()) {
+      const at = `/${collection}/${nodeIndex}/sources/${sourceIndex}`;
+      let sourcePath;
+      try {
+        sourcePath = withDiagnosticRecordingSuppressed(() => verifiedSourcePath(authored.path, `${at}/path`));
+      } catch {
+        continue;
+      }
+      const object = `${revision}:${sourcePath}`;
+      citedObjects.set(object, citedObjects.get(object) || Boolean(authored.line));
+    }
+  }
+  const prefetchedBlobs = prefetchBlobs(realRoot, citedObjects);
 
   const nodes = Object.create(null);
   let referenceCount = 0;
@@ -206,8 +298,14 @@ export function verifyRepositoryEvidence(diagramType, diagram, repoRootInput) {
         });
       }
       const object = `${revision}:${source.path}`;
-      const type = runGit(realRoot, ['cat-file', '-t', object]);
-      if (type.status !== 0 || type.stdout.trim() !== 'blob') {
+      const prefetched = prefetchedBlobs ? prefetchedBlobs.get(object) : undefined;
+      const objectIsBlob = prefetched
+        ? !prefetched.missing && prefetched.type === 'blob'
+        : (() => {
+          const type = runGit(realRoot, ['cat-file', '-t', object]);
+          return type.status === 0 && type.stdout.trim() === 'blob';
+        })();
+      if (!objectIsBlob) {
         evidenceFailure('repository-evidence/file-missing', `${where} does not identify a file at revision ${revision}.`, {
           subject: { path: where, ...nodeSubject },
           evidence: { sourcePath: source.path, revision },
@@ -215,7 +313,9 @@ export function verifyRepositoryEvidence(diagramType, diagram, repoRootInput) {
         });
       }
       if (source.line) {
-        const content = runGit(realRoot, ['show', object]);
+        const content = prefetched && Object.hasOwn(prefetched, 'content')
+          ? { status: 0, stdout: prefetched.content }
+          : runGit(realRoot, ['show', object]);
         if (content.status !== 0) evidenceFailure('repository-evidence/file-unreadable', `${where} could not be read at revision ${revision}.`, {
           subject: { path: where, ...nodeSubject },
           evidence: { sourcePath: source.path, revision },
@@ -251,7 +351,7 @@ export function verifyRepositoryEvidence(diagramType, diagram, repoRootInput) {
       revision,
       shortRevision: revision.slice(0, 7),
       label: location.provider === 'github' ? location.path : location.url.replace(/^(?:https?:\/\/|ssh:\/\/git@|git@)/, ''),
-      ...(linkMode === 'web' ? { href: `${location.url}/tree/${revision}` } : { linkMode }),
+      ...(linkMode === 'web' ? { href: repositoryTreeHref(location.provider, location.url, revision) } : { linkMode }),
     },
     referenceCount,
     nodes,

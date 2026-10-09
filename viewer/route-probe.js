@@ -334,6 +334,8 @@
       }
       function traceGeometry(shape, step) {
         var clone = shape.cloneNode(false);
+        if (shape.getAttribute('data-motion-path')) clone.setAttribute('d', shape.getAttribute('data-motion-path'));
+        clone.removeAttribute('data-motion-path');
         clone.removeAttribute('id');
         clone.removeAttribute('class');
         clone.removeAttribute('style');
@@ -434,6 +436,8 @@
       }
       function journeyGeometry(shape) {
         var clone = shape.cloneNode(false);
+        if (shape.getAttribute('data-motion-path')) clone.setAttribute('d', shape.getAttribute('data-motion-path'));
+        clone.removeAttribute('data-motion-path');
         clone.removeAttribute('id');
         clone.removeAttribute('class');
         clone.removeAttribute('style');
@@ -794,9 +798,6 @@
         if (Array.isArray(focused)) focused = null;
         clear({ updateUrl: false, preserveView: true, restoreFocus: false });
         if (Archify.intentTrace && typeof Archify.intentTrace.clear === 'function') Archify.intentTrace.clear({ announce: false });
-        if (Archify.guidedViews && typeof Archify.guidedViews.showAll === 'function') {
-          Archify.guidedViews.showAll({ clearFocus: false, updateUrl: false });
-        }
         if (Archify.focus && typeof Archify.focus.clear === 'function') {
           Archify.focus.clear({ updateUrl: false, preserveView: true });
         }

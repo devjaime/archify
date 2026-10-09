@@ -35,7 +35,6 @@
           html.getAttribute('data-guide-open') === 'true' ||
           container.classList.contains('is-panning') ||
           svg.hasAttribute('data-lens-active') ||
-          svg.hasAttribute('data-story-active') ||
           svg.hasAttribute('data-relationship-preview-active') ||
           !!(Archify.routeProbe && typeof Archify.routeProbe.active === 'function' && Archify.routeProbe.active()) ||
           !!(Archify.focus && typeof Archify.focus.active === 'function' && Archify.focus.active());
@@ -65,6 +64,8 @@
       }
       function traceGeometry(shape, direction) {
         var clone = shape.cloneNode(false);
+        if (shape.getAttribute('data-motion-path')) clone.setAttribute('d', shape.getAttribute('data-motion-path'));
+        clone.removeAttribute('data-motion-path');
         clone.removeAttribute('id');
         clone.removeAttribute('class');
         clone.removeAttribute('style');

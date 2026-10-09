@@ -183,7 +183,7 @@
         return selectedKinds.length > 0 || !panel.hidden || html.getAttribute('data-present') === 'true' ||
           svg.hasAttribute('data-focus-active') || svg.hasAttribute('data-intent-trace-active') ||
           svg.hasAttribute('data-route-picking') || svg.hasAttribute('data-route-active') ||
-          svg.hasAttribute('data-story-active') || svg.hasAttribute('data-relationship-preview-active');
+          svg.hasAttribute('data-relationship-preview-active');
       }
       function previewLegendKind(entry) {
         clearLegendPreview();
@@ -234,6 +234,8 @@
       }
       function flowGeometry(shape, direction, step) {
         var clone = shape.cloneNode(false);
+        if (shape.getAttribute('data-motion-path')) clone.setAttribute('d', shape.getAttribute('data-motion-path'));
+        clone.removeAttribute('data-motion-path');
         clone.removeAttribute('id');
         clone.removeAttribute('class');
         clone.removeAttribute('style');
@@ -454,9 +456,6 @@
         }
         if (Archify.routeProbe && typeof Archify.routeProbe.clear === 'function') {
           Archify.routeProbe.clear({ updateUrl: false, restoreFocus: false });
-        }
-        if (Archify.guidedViews && typeof Archify.guidedViews.showAll === 'function') {
-          Archify.guidedViews.showAll({ clearFocus: false, updateUrl: false });
         }
         if (Archify.intentTrace && typeof Archify.intentTrace.clear === 'function') {
           Archify.intentTrace.clear({ announce: false });
